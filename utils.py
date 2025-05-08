@@ -1,13 +1,13 @@
 import re 
 import logging
-from datetime import datetime
+from datetime import datetime, timedelta
 import nltk
 from nltk.sentiment.vader import SentimentIntensityAnalyzer
-import mysql.connector
 import os 
 from dotenv import load_dotenv
 from datetime import date
 import emoji
+from database import Message, Log, SessionLocal
 
 
 load_dotenv()
@@ -15,10 +15,6 @@ load_dotenv()
 nltk.download('vader_lexicon')
 sia = SentimentIntensityAnalyzer()
 
-def is_emoji(message: str) -> bool:
-    pattern = re.sub(r"<a?:\w+:\d+>", "", message)
-    without_emoji = emoji.replace_emoji(pattern, "")
-    return len(without_emoji.strip()) == 0
 
 log_path = os.getenv("LOG_PATH")
 logger = logging.getLogger(__name__)
@@ -27,72 +23,97 @@ logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",    
 )
-user=os.getenv("USER")
-password=os.getenv("PASSWORD")
-host=os.getenv("HOST")
-database=os.getenv("DATABASE")
-conn = mysql.connector.connect(
-    user=user,
-    password=password,
-    host=host,
-    database=database
-)
+
+def is_emoji(message: str) -> bool:
+    pattern = re.sub(r"<a?:\w+:\d+>", "", message)
+    without_emoji = emoji.replace_emoji(pattern, "")
+    return len(without_emoji.strip()) == 0
 
 
 async def load_messages(bot, channel_id, limit=None):
     channel = bot.get_channel(channel_id)
-    cursor = conn.cursor()
+    session = SessionLocal()
     if channel:
         async for msg in channel.history(limit=limit):
             if msg.stickers or msg.attachments or msg.embeds or msg.content.startswith("https://") or msg.author.bot or is_emoji(msg.content):
                 continue
-            cursor.execute("SELECT 1 FROM messages WHERE id = %s", (msg.id,))
-            if cursor.fetchone() is None:
+            if not session.query(Message).filter_by(id=msg.id).first():
                 try:
-                    cursor.execute("INSERT IGNORE INTO messages (id, author_name, author_id, message, message_send_timestamp, created_at, updated_at) VALUES (%s, %s, %s, %s, %s, %s, %s)",
-                    (msg.id, msg.author.name, msg.author.id, msg.content, msg.created_at, datetime.utcnow(), datetime.utcnow()))
-                except mysql.connector.Error as err:
-                    cursor.execute ("INSERT INTO log (message, level) VALUES (%s, %s)", (f"failed to insert message {err}", "ERROR"))
+                    message = Message(
+                        id=msg.id,
+                        author_name=msg.author.name,
+                        author_id=msg.author.id,
+                        message=msg.content,
+                        message_send_timestamp=msg.created_at,
+                        created_at=datetime.utcnow(),
+                        updated_at=datetime.utcnow()
+                    )
+                    session.add(message)
+                    session.commit()
+                except Exception as err:
                     logger.error(f"failed to insert message {err}")
-        cursor.close()  
-        conn.commit()
+        session.close()
 
 
 async def get_messages(days):
-    cursor = conn.cursor()
-    cursor.execute("SELECT message FROM messages WHERE message_send_timestamp BETWEEN NOW() - INTERVAL %s DAY AND NOW()", (days,))
-    messages = cursor.fetchall()
-    result = [msg[-1] for msg in messages]
-    cursor.close()
-    conn.commit() 
+    session = SessionLocal()
+    messages = session.query(Message).filter(
+        Message.message_send_timestamp.between(
+            datetime.utcnow() - timedelta(days=days),
+            datetime.utcnow()
+        )
+    ).all()
+    result = [msg.message for msg in messages]
+    session.close()
     return result
     
     
 
 async def analyze(messages):
-    cursor = conn.cursor()
+    session = SessionLocal()
     if not messages: 
-        cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("no messages to analyze", "INFO"))
+        log = Log(
+            message="no messages to analyze",
+            level="INFO"
+        )
+        session.add(log)
+        session.commit()
         logger.info("no messages to analyze")
         return 0
     scores = [sia.polarity_scores(msg)['compound'] for msg in messages]
     if scores:
         avg_compound = sum(scores) / len(scores)
-        cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", (f"average compound score {avg_compound}", "INFO"))
+        log = Log(
+            message=f"average compound score {avg_compound}",
+            level="INFO"
+        )
+        session.add(log)
+        session.commit()
+        logger.info(f"average compound score {avg_compound}")
         return avg_compound
-    cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("no valid sentiment score found", "INFO"))
-    cursor.close()
-    conn.commit()
+    log = Log(
+        message = "no valid sentiment score found",
+        level = "INFO"
+    )
+    session.add(log)
+    session.commit()
+    logger.info("no valid sentiment score found")
+    session.close()
     return 0
 
 
 
 async def send_report(bot, channel_id, days):
-    cursor = conn.cursor()
+    session = SessionLocal()
     messages = await get_messages(days)
     channel = bot.get_channel(channel_id)
     if not messages:
-        cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("no messages to analyze", "INFO"))
+        log = Log(
+            mesage="no messages to analyze",
+            level="INFO"
+        )
+        session.add(log)   
+        session.commit()
         logger.info("no messages to analyze")
         await channel.send("no data found to be analyzed")
         return
@@ -103,7 +124,7 @@ async def send_report(bot, channel_id, days):
     await channel.send(f"{label}")
 
 async def regular_update(last_7: date, last_30: date, last_180: date, bot, channel_id):
-    cursor = conn.cursor()
+    session = SessionLocal()
     today = date.today()
     days_since_7 = (today - last_7).days
     days_since_30 = (today - last_30).days
@@ -113,32 +134,61 @@ async def regular_update(last_7: date, last_30: date, last_180: date, bot, chann
         try:
             await send_report(bot, channel_id, 7)
             last_7 = today
-            cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("regular update over 7 days", "INFO",))
+            log = Log(
+                message="regular update over 7 days",
+                level="INFO"
+            )
+            session.add(log)
+            session.commit()
             logger.info("regular update over 7 days")
         except Exception as err:
             logger.error(f"failed to regularly update over 7 days {err}")
-            cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", (f"failed to regularly update over 7 days {err}", "ERROR",))
+            log = Log(
+                message=f"failed to regularly update over 7 days {err}",
+                level="ERROR"
+            )
+            session.add(log)
+            session.commit()
             
     if days_since_30 >= 30:
         try:
             await send_report(bot, channel_id, 30)
             last_30 = today
-            cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("regular update over 30 days", "INFO"))
+            log = Log(
+                message="regular update over 30 days",
+                level="INFO"
+            )
+            session.add(log)
+            session.commit()        
             logger. info("regular update over 30 days") 
         except Exception as err:
-            cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", (f"failed to regularly update over 30 days {err}", "ERROR",))
+            log= Log(
+                message=f"failed to regularly update over 30 days {err}",
+                level="ERROR"
+            )
+            session.add(log)
+            session.commit()
             logger.error(f"failed to regularly update over 30 days {err}")
 
     if days_since_180 >= 180:
         try:
             await send_report(bot, channel_id, 180)
             last_180 = today
-            cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("regular update over 180 days", "INFO"))
+            log = Log(
+                message="regular update over 180 days",
+                level="INFO"
+            )
+            session.add(log)
+            session.commit()
             logger.info("regular update over 180 days")
         except Exception as err:
-            cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", (f"failed to regularly update over 180 days {err}", "ERROR",))
+            log = Log(
+                message=f"failed to regularly update over 180 days {err}",
+                level="ERROR"
+            )
+            session.add(log)
+            session.commit()
             logger.error(f"failed to regularly update over 180 days {err}")
     else:
-        cursor.close()
-        conn.commit()
+        session.close()
     return last_7, last_30, last_180

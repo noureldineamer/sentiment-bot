@@ -6,11 +6,13 @@ import discord
 import utils
 from discord.ext import commands
 from dotenv import load_dotenv
-import database
+from database import Message, Log, SessionLocal, init_db
+from sqlalchemy import Select, update
+
 
 load_dotenv()
 
-conn = utils.conn
+
 
 log_path = os.getenv("LOG_PATH")
 logger = logging.getLogger(__name__)
@@ -35,40 +37,128 @@ channel = bot.get_channel(current_channel)
 bot.get_channel(current_channel)
 
 
+
 @bot.command()
 async def analyze(ctx, days, channel=channel):
-    cursor = conn.cursor()
+    session = SessionLocal()
     try:
         days = int(days)
         if days < 1 or days > 365:
-            cursor.execute("INSERT INTO log (author_name, author_id, message, level) VALUES (%s, %s, %s, %s)", (ctx.author.name, ctx.author.id, f"invalid number of days {days}", "ERROR"))
+            log = Log(
+            author_name=ctx.author.name,
+            author_id=ctx.author.id,
+            message=f"invalid number of days {days}",
+            level="ERROR",
+            )
+            session.add(log)
+            session.commit()
             logger.error(f"invalid number of days {days}")
             await ctx.author.send("invalid number of days, max is 365")
             return
-        cursor.execute("INSERT INTO log (author_name, author_id, message, level) VALUES (%s, %s, %s, %s)", (ctx.author.name, ctx.author.id, f"analyzing data for {days} days", "INFO"))
+        log = Log(
+            author_name=ctx.author.name,
+            author_id=ctx.author.id,
+            message=f"analyzing data for {days} days",
+            level="INFO"
+        )
+        session.add(log)
+        session.commit()
         logger.info(f"analyzing data for {days} days")
         await utils.send_report(bot, current_channel, days)
     except ValueError:
         await ctx.author.send("Invalid input! please enter a valid number between 1 and 365")
         logger.error(f"invalid input {days}")
-        cursor.execute = ("INSERT INTO log (author_name, author_id, message, level) VALUES (%s, %s, %s, %s)", (ctx.author.name, ctx.author.id, f"invalid input {days}", "ERROR"))
+        log = Log(
+            author_name=ctx.author.name,
+            author_id=ctx.author.id,
+            message=f"invalid input {days}",
+            level="ERROR"
+        )
+        session.add(log)
+        session.commit()
         return
     except Exception as err:
-        cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", (f"failed to analyze data {err}", "ERROR",))
+        log = Log(
+            author_name=ctx.author.name,
+            author_id=ctx.author.id,
+            message=f"failed to analyze data {err}",
+            level="ERROR"
+        )
+        session.add(log)
+        session.commit()
         logger.error(f"analyze error {err}")
     finally:
-        cursor.close()
-        conn.commit()
+        session.close()
+
+
+
+@bot.event
+async def on_message_edit(before, after):
+    print("in message edit")
+    if before.author.bot:
+        return
+    session = SessionLocal()
+    try: 
+        if before.content != after.content:
+            stmt = update(Message).where(Message.id == before.id and before.author.id == Message.author_id).values(
+                message=after.content,
+                updated_at=after.created_at
+                )
+            session.execute(stmt)
+            session.commit()
+            log = Log(
+                message="message updated",
+                level="INFO"
+            )
+            session.add(log)
+            session.commit()
+            logger.info("message edited by user {before.author.name}")
+    except Exception as err:
+        log = Log(
+            message=f"failed to update message {err}",
+            level="ERROR"
+        )
+        session.add(log)
+        session.commit()
+        logger.error(f"failed to update message {err}")
+    finally:
+        session.close()
+
+
     
+@bot.event
+async def on_message(message):
+    if message.channel.id == current_channel and not message.author.bot:
+        session = SessionLocal()
+        try:
+            await utils.load_messages(bot, current_channel)
+        except Exception as err:
+            log = Log(
+                message=f"failed to load messages {err}",
+                level="ERROR"
+            )
+            session.add(log)
+            session.commit()
+            logger.error(f"Failed to save message: {err}")
+        finally:
+            session.close()
+
+
 
 @bot.event
 async def on_ready():
-    database.create_database()
+    session = SessionLocal()
+    init_db()
+
     bot.get_channel(current_channel)
 
-    cursor = conn.cursor()
-    cursor.execute("INSERT INTO log (message, level) VALUES (%s, %s)", ("bot started successfully", "INFO",))
-    await utils.load_messages(bot, current_channel)
+    log = Log(
+        message="bot started successfully",
+        level="INFO"
+    )
+    session.add(log)
+    session.commit()
+    logger.info("bot started successfully")
     
     last_7 = date(2025, 3, 1)
     last_30 = date(2025, 2, 15)
@@ -80,11 +170,15 @@ async def on_ready():
     
         
 try:
-    cursor = conn.cursor()
+    session = SessionLocal()
     bot.run(TOKEN)
 except Exception as err:
-    cursor.execute ("INSERT INTO log (message, level) VALUES (%s, %s)", (f"bot failed to start {err}", "ERROR"))
+    log = Log(
+        message=f"bot failed to start {err}",
+        level="ERROR"
+    )
+    session.add(log)
+    session.commit()
     logger.error(f"bot failed to start {err}")
 finally:
-    cursor.close()
-    conn.commit()
+    session.close()
